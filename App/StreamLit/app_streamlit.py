@@ -20,7 +20,7 @@ except Exception:
 
 # ------------------- Defaults (relative paths for Cloud) -------------------
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_PATH = str(BASE_DIR / "MOSI_aligned_combined.xlsx")
+DEFAULT_DATA_PATH = str(BASE_DIR / "MOSI_aligned_combined.csv")
 DEFAULT_VIDEO_DIR = ""   # leave empty on Cloud (use YouTube fallback)
 DEFAULT_AUDIO_DIR = ""   # leave empty on Cloud
 DEFAULT_SUS_URL   = ""   # paste your Google Form link here (or fill from sidebar)
@@ -522,3 +522,4 @@ else:
         st.sidebar.caption(f"Words: {res['n_words']} • Peaks: {res['n_peaks']} • Window ±{res['window_s']:.2f}s • q={res['peak_quantile']:.2f}")
     elif res and not res.get("ok"):
         st.sidebar.warning(f"MAE unavailable: {res.get('reason','unknown')}")
+
