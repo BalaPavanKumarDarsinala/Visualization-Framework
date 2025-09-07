@@ -1,17 +1,6 @@
-# Core
 streamlit
 pandas
 numpy
 plotly
-
-# Excel I/O used by pandas + writer
 openpyxl
 xlsxwriter
-
-# Audio (waveform + MAE in the app)
-librosa
-soundfile
-
-# MMSDK aligner + HDF5 helpers (used by mosi_align.py)
-mmsdk
-h5py
