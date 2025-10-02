@@ -101,14 +101,6 @@ def get_local_paths(video_id):
     a = AUDIO_DIR / f"{video_id}.wav"
     return (v if v.exists() else None, a if a.exists() else None)
 
-def find_local_video(video_id):
-    v, _ = get_local_paths(video_id)
-    return str(v) if v else None
-
-def find_local_audio(video_id):
-    _, a = get_local_paths(video_id)
-    return str(a) if a else None
-
 # ------------------- Cached loaders -------------------
 @st.cache_data(show_spinner=False)
 def load_aligned(path_or_buf, sheet=None):
@@ -156,50 +148,6 @@ def make_subtitles(df_video: pd.DataFrame, gap: float = 0.6) -> pd.DataFrame:
 def get_subtitles_for_video(df_all: pd.DataFrame, video_id: str, gap: float = 0.6) -> pd.DataFrame:
     return make_subtitles(df_all[df_all["video_id"].astype(str)==str(video_id)].copy(), gap=gap)
 
-# Emotion mapping
-BASIC_EMOS = ["joy","anger","sadness","surprise","fear","disgust","contempt","neutral"]
-
-def pretty_emo(name: str) -> str: return name.replace("_"," ").title()
-
-def pick_emotion_text(row: pd.Series, facet_map: dict, facet_generic: list[str]):
-    have = {e: facet_map[e] for e in BASIC_EMOS if e in facet_map}
-    if have:
-        cols = [have[e] for e in have]
-        try:
-            vals = row[cols].astype(float).values
-            if not np.all(np.isnan(vals)):
-                idx = int(np.nanargmax(vals))
-                emo = list(have.keys())[idx]
-                score = float(vals[idx]) if not np.isnan(vals[idx]) else 0.0
-                display = {"joy":"Happy","anger":"Angry","sadness":"Sad",
-                           "surprise":"Surprised","fear":"Afraid","disgust":"Disgusted",
-                           "contempt":"Contempt","neutral":"Neutral"}.get(emo, pretty_emo(emo))
-                return display, score, cols
-        except Exception:
-            pass
-    if "valence" in facet_map:
-        try:
-            v = float(row[facet_map["valence"]])
-            if v > 0.2: return "Happy", v, [facet_map["valence"]]
-            if v < -0.2: return "Sad",   v, [facet_map["valence"]]
-            return "Neutral", v, [facet_map["valence"]]
-        except Exception:
-            pass
-    if "smile" in facet_map:
-        try:
-            s = float(row[facet_map["smile"]])
-            if s > 0.5: return "Happy", s, [facet_map["smile"]]
-        except Exception:
-            pass
-    au12 = [c for c in facet_generic if "au12" in c.lower()]
-    if au12:
-        try:
-            v = float(row[au12[0]])
-            if v > 0.5: return "Happy", v, [au12[0]]
-        except Exception:
-            pass
-    return "Neutral", 0.0, []
-
 # ------------------- Waveform -------------------
 @st.cache_data(show_spinner=False)
 def load_waveform_for_vid(vid: str, target_sr: int = 16000):
@@ -240,27 +188,28 @@ start_load = time.perf_counter()
 if mode == "Upload file":
     up = st.sidebar.file_uploader("Upload aligned CSV/XLSX", type=["csv","xlsx","xls"])
     if up is None:
+        st.warning("Please upload your aligned file to continue.")
         st.stop()
     df_all = load_aligned(up)
     loaded_path_display = "(uploaded)"
 else:
+    if not DEFAULT_DATA_PATH or not os.path.exists(DEFAULT_DATA_PATH):
+        st.warning("No default aligned file found in repo. Please upload one from the sidebar.")
+        st.stop()
     df_all = load_aligned(DEFAULT_DATA_PATH)
     loaded_path_display = DEFAULT_DATA_PATH
+
 load_time = time.perf_counter() - start_load
 st.sidebar.metric("Data load time", f"{load_time:.2f}s")
 st.sidebar.caption(f"Using: {loaded_path_display}")
 st.sidebar.success(f"Rows loaded: {len(df_all):,}")
 
+# ------------------- Silence filter -------------------
 hide_silence = st.sidebar.checkbox("Hide silence tokens (sp/sil)", True)
 if hide_silence and "word" in df_all.columns:
     SILENCE = {"sp","sil","[sp]","[sil]","<sp>","<sil>",""}
     df_all = df_all[~df_all["word"].astype(str).str.lower().isin(SILENCE)].reset_index(drop=True)
     st.sidebar.info(f"Rows after silence filter: {len(df_all):,}")
-
-st.sidebar.header("SUS (Usability)")
-sus_url = DEFAULT_SUS_URL or st.sidebar.text_input("SUS Google Form URL", "")
-if sus_url:
-    st.sidebar.markdown(f"[Open SUS survey]({sus_url})")
 
 # ------------------- Video selection -------------------
 video_ids = df_all["video_id"].astype(str).unique().tolist()
@@ -274,25 +223,19 @@ if df.empty:
     st.error("No rows for selected video.")
     st.stop()
 
-facet_map, facet_generic = detect_facet_columns(df)
-
-t_min = float(np.nanmin(pd.to_numeric(df["word_start"], errors="coerce")))
-t_max_words = float(np.nanmax(pd.to_numeric(df["word_end"],   errors="coerce")))
-t_max_slider = float(np.nextafter(t_max_words, np.inf))
-cur_default = float(df["word_mid"].iloc[0]) if len(df) else t_min
-
 # ------------------- Layout -------------------
 left, right = st.columns([1, 2], gap="large")
 
 with left:
     st.subheader("Playback")
     if "cur_t" not in st.session_state:
-        st.session_state.cur_t = cur_default
+        st.session_state.cur_t = float(df["word_mid"].iloc[0]) if len(df) else 0.0
 
     st.session_state.cur_t = st.slider(
-        "Time (s)", min_value=t_min, max_value=t_max_slider,
-        value=min(st.session_state.cur_t, t_max_words),
-        step=0.001, format="%.3f", key="time_slider",
+        "Time (s)", min_value=float(df["word_start"].min()), 
+        max_value=float(df["word_end"].max()),
+        value=st.session_state.cur_t, step=0.001, format="%.3f",
+        key="time_slider",
     )
     cur_t = float(st.session_state.cur_t)
 
@@ -305,10 +248,6 @@ with left:
         j = nearest_idx(cur_t, subs["mid"].values)
         st.markdown("**Subtitle (now)**")
         st.write(subs.iloc[j]["text"])
-
-    # Emotion text
-    emo_text, emo_score, emo_cols = pick_emotion_text(row, facet_map, facet_generic)
-    st.metric("Emotion (now)", f"{emo_text} ({emo_score:.2f})")
 
     # Video handling
     st.markdown("**Video**")
@@ -323,12 +262,6 @@ with left:
     else:
         st.error("No playable video found (may be expired).")
 
-    st.download_button(
-        "Download this video's rows (CSV)",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{vid}_aligned.csv", mime="text/csv"
-    )
-
 with right:
     st.subheader("Audio waveform")
     t_wav, y_wav, wav_err = load_waveform_for_vid(vid, target_sr=16000)
@@ -340,27 +273,4 @@ with right:
         wav_fig.add_trace(go.Scatter(x=tt, y=yy, mode="lines", name="waveform"))
         ws, we = float(row["word_start"]), float(row["word_end"])
         wav_fig.add_vline(x=cur_t, line_width=2, line_dash="dash")
-        wav_fig.add_shape(type="rect", x0=ws, x1=we, y0=min(yy), y1=max(yy),
-                          line=dict(width=0), fillcolor="rgba(200,200,200,0.3)")
         st.plotly_chart(wav_fig, use_container_width=True)
-
-    st.subheader("Timeline & Features")
-    cov_cols_v = get_cols_by_prefix(df, "covarep_f")
-    vis_cols_v = get_cols_by_prefix(df, "visual_f")
-    default_cov = cov_cols_v[:3] if cov_cols_v else []
-    default_vis = vis_cols_v[:3] if vis_cols_v else []
-    sel_cov = st.multiselect("COVAREP features to plot", cov_cols_v, default=default_cov)
-    sel_vis = st.multiselect("OpenFace (visual) features to plot", vis_cols_v, default=default_vis)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["word_mid"], y=[0]*len(df), mode="markers",
-                             marker=dict(size=6), name="words",
-                             hovertext=df["word"], hoverinfo="text+x"))
-    for c in sel_cov+sel_vis:
-        vals = pd.to_numeric(df[c], errors="coerce").values
-        if not np.all(np.isnan(vals)):
-            mu, sd = np.nanmean(vals), np.nanstd(vals)
-            v = (vals - mu) / (sd + 1e-8) if sd > 0 else vals
-            fig.add_trace(go.Scatter(x=df["word_mid"], y=v, mode="lines", name=c))
-    fig.add_vline(x=cur_t, line_width=2, line_dash="dash")
-    st.plotly_chart(fig, use_container_width=True)
