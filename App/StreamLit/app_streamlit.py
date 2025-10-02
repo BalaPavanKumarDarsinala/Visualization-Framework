@@ -5,6 +5,7 @@
 import os
 import glob
 import time
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -18,18 +19,21 @@ try:
 except Exception:
     librosa = None
 
-# ------------------- Defaults (relative paths for Cloud) -------------------
+# ------------------- Defaults -------------------
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_PATH = str(BASE_DIR / "MOSI_aligned_combined.csv")
-DEFAULT_VIDEO_DIR = ""   # leave empty on Cloud (use YouTube fallback)
-DEFAULT_AUDIO_DIR = ""   # leave empty on Cloud
-DEFAULT_SUS_URL   = ""   # paste your Google Form link here (or fill from sidebar)
+DEFAULT_DATA_PATH = str(BASE_DIR / "MOSI_aligned_combined.xlsx")
+VIDEO_DIR = BASE_DIR / "Video"
+AUDIO_DIR = BASE_DIR / "Audio"
+VIDEO_DIR.mkdir(exist_ok=True)
+AUDIO_DIR.mkdir(exist_ok=True)
+
+DEFAULT_SUS_URL = ""   # paste your Google Form link here (or fill from sidebar)
 
 PAGE_TITLE = "CMU-MOSI Aligned Viewer (Video • Audio • Expressions • Evaluation)"
 st.set_page_config(page_title=PAGE_TITLE, layout="wide")
 st.title(PAGE_TITLE)
 
-# ------------------- Small helpers -------------------
+# ------------------- Helpers -------------------
 def coerce_word(x):
     if isinstance(x, bytes):
         try:
@@ -70,23 +74,40 @@ def nearest_idx(val, arr):
         return 0
     return int(np.argmin(np.abs(arr - float(val))))
 
-def find_local_video(video_dir, vid):
-    if not video_dir:
-        return None
-    for ext in (".mp4",".avi",".mov",".mkv",".webm",".m4v"):
-        p = Path(video_dir) / f"{vid}{ext}"
-        if p.is_file(): return str(p)
-    gl = glob.glob(str(Path(video_dir) / f"{vid}.*"))
-    return gl[0] if gl else None
+def download_youtube_video(video_id):
+    """Download video+audio from YouTube for given MOSI ID"""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        subprocess.run([
+            "yt-dlp", "-f", "mp4",
+            "-o", f"{VIDEO_DIR}/{video_id}.%(ext)s",
+            url
+        ], check=True)
 
-def find_local_audio(audio_dir, vid):
-    if not audio_dir:
-        return None
-    for ext in (".wav",".mp3",".m4a",".ogg",".flac"):
-        p = Path(audio_dir) / f"{vid}{ext}"
-        if p.is_file(): return str(p)
-    gl = glob.glob(str(Path(audio_dir) / f"{vid}.*"))
-    return gl[0] if gl else None
+        subprocess.run([
+            "yt-dlp", "-f", "bestaudio", "--extract-audio",
+            "--audio-format", "wav", "--audio-quality", "0",
+            "-o", f"{AUDIO_DIR}/{video_id}.%(ext)s",
+            url
+        ], check=True)
+
+        return True
+    except Exception as e:
+        st.warning(f"Could not download video {video_id}: {e}")
+        return False
+
+def get_local_paths(video_id):
+    v = VIDEO_DIR / f"{video_id}.mp4"
+    a = AUDIO_DIR / f"{video_id}.wav"
+    return (v if v.exists() else None, a if a.exists() else None)
+
+def find_local_video(video_id):
+    v, _ = get_local_paths(video_id)
+    return str(v) if v else None
+
+def find_local_audio(video_id):
+    _, a = get_local_paths(video_id)
+    return str(a) if a else None
 
 # ------------------- Cached loaders -------------------
 @st.cache_data(show_spinner=False)
@@ -137,6 +158,7 @@ def get_subtitles_for_video(df_all: pd.DataFrame, video_id: str, gap: float = 0.
 
 # Emotion mapping
 BASIC_EMOS = ["joy","anger","sadness","surprise","fear","disgust","contempt","neutral"]
+
 def pretty_emo(name: str) -> str: return name.replace("_"," ").title()
 
 def pick_emotion_text(row: pd.Series, facet_map: dict, facet_generic: list[str]):
@@ -178,23 +200,23 @@ def pick_emotion_text(row: pd.Series, facet_map: dict, facet_generic: list[str])
             pass
     return "Neutral", 0.0, []
 
-# Waveform + downsampling (used by audio panel & MAE)
+# ------------------- Waveform -------------------
 @st.cache_data(show_spinner=False)
-def load_waveform_for_vid(vid: str, audio_dir: str, video_dir: str, target_sr: int = 16000):
+def load_waveform_for_vid(vid: str, target_sr: int = 16000):
     if librosa is None:
         return None, None, "librosa_not_installed"
-    a_path = find_local_audio(audio_dir, vid) if audio_dir else None
-    if a_path and os.path.isfile(a_path):
+    _, a = get_local_paths(vid)
+    if a and a.exists():
         try:
-            y, sr = librosa.load(a_path, sr=target_sr, mono=True)
+            y, sr = librosa.load(a, sr=target_sr, mono=True)
             t = np.arange(len(y), dtype=np.float32) / float(sr)
             return t, y.astype(np.float32), None
-        except Exception:
-            pass
-    v_path = find_local_video(video_dir, vid) if video_dir else None
-    if v_path and os.path.isfile(v_path):
+        except Exception as e:
+            return None, None, f"decode_failed: {e}"
+    v, _ = get_local_paths(vid)
+    if v and v.exists():
         try:
-            y, sr = librosa.load(v_path, sr=target_sr, mono=True)
+            y, sr = librosa.load(v, sr=target_sr, mono=True)
             t = np.arange(len(y), dtype=np.float32) / float(sr)
             return t, y.astype(np.float32), None
         except Exception as e:
@@ -210,49 +232,7 @@ def downsample_for_plot(t, y, max_points=4000):
     idx = np.linspace(0, n-1, num=max_points, dtype=int)
     return t[idx], y[idx]
 
-# ------------------- Evaluation: MAE (word mid vs audio RMS peaks) -------------------
-@st.cache_data(show_spinner=False)
-def compute_sync_mae(vid: str, df_video: pd.DataFrame, audio_dir: str, video_dir: str,
-                     sr: int = 16000, frame_length: int = 1024, hop_length: int = 512,
-                     peak_quantile: float = 0.70, window_s: float = 0.35):
-    if librosa is None:
-        return {"ok": False, "reason": "librosa_not_installed"}
-    t, y, err = load_waveform_for_vid(vid, audio_dir, video_dir, target_sr=sr)
-    if y is None:
-        return {"ok": False, "reason": err}
-    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop_length)
-    thr = np.nanquantile(rms, peak_quantile)
-    middle = (rms[1:-1] >= rms[:-2]) & (rms[1:-1] > rms[2:]) & (rms[1:-1] >= thr)
-    peak_idx = np.where(middle)[0] + 1
-    peak_times = times[peak_idx]
-    if peak_times.size == 0:
-        return {"ok": False, "reason": "no_peaks_found"}
-    mids = pd.to_numeric(df_video["word_mid"], errors="coerce").astype(float).values
-    errors, chosen = [], []
-    half = float(window_s)
-    for m in mids:
-        mask = (peak_times >= (m - half)) & (peak_times <= (m + half))
-        cand = peak_times[mask]
-        p = float(cand[np.argmin(np.abs(cand - m))]) if cand.size else float(times[nearest_idx(m, times)])
-        errors.append(abs(m - p)); chosen.append(p)
-    errors = np.array(errors, dtype=float)
-    return {
-        "ok": True,
-        "n_words": int(len(mids)),
-        "n_peaks": int(len(peak_times)),
-        "mae": float(np.nanmean(errors)),
-        "median": float(np.nanmedian(errors)),
-        "p90": float(np.nanpercentile(errors, 90)),
-        "window_s": float(window_s),
-        "peak_quantile": float(peak_quantile),
-        "peak_times": peak_times.astype(float),
-        "picked_times": np.array(chosen, dtype=float),
-        "rms_times": times.astype(float),
-        "rms_vals": rms.astype(float),
-    }
-
-# ------------------- Sidebar: data source + load time -------------------
+# ------------------- Sidebar: load aligned -------------------
 st.sidebar.header("Data source")
 mode = st.sidebar.radio("Load aligned data from:", ["Default path", "Upload file"], index=0)
 
@@ -264,7 +244,6 @@ if mode == "Upload file":
     df_all = load_aligned(up)
     loaded_path_display = "(uploaded)"
 else:
-    st.sidebar.text_input("Default data path", DEFAULT_DATA_PATH, key="data_path_echo", disabled=True)
     df_all = load_aligned(DEFAULT_DATA_PATH)
     loaded_path_display = DEFAULT_DATA_PATH
 load_time = time.perf_counter() - start_load
@@ -272,18 +251,11 @@ st.sidebar.metric("Data load time", f"{load_time:.2f}s")
 st.sidebar.caption(f"Using: {loaded_path_display}")
 st.sidebar.success(f"Rows loaded: {len(df_all):,}")
 
-# Silence filter
 hide_silence = st.sidebar.checkbox("Hide silence tokens (sp/sil)", True)
 if hide_silence and "word" in df_all.columns:
     SILENCE = {"sp","sil","[sp]","[sil]","<sp>","<sil>",""}
     df_all = df_all[~df_all["word"].astype(str).str.lower().isin(SILENCE)].reset_index(drop=True)
     st.sidebar.info(f"Rows after silence filter: {len(df_all):,}")
-
-# Media + SUS
-st.sidebar.header("Media sources")
-video_dir = st.sidebar.text_input("Local video folder (optional)", DEFAULT_VIDEO_DIR)
-audio_dir = st.sidebar.text_input("Local audio folder (optional)", DEFAULT_AUDIO_DIR)
-use_youtube = st.sidebar.checkbox("Fallback to YouTube embed if local video not found", True)
 
 st.sidebar.header("SUS (Usability)")
 sus_url = DEFAULT_SUS_URL or st.sidebar.text_input("SUS Google Form URL", "")
@@ -293,7 +265,7 @@ if sus_url:
 # ------------------- Video selection -------------------
 video_ids = df_all["video_id"].astype(str).unique().tolist()
 if not video_ids:
-    st.error("No video_ids found. Check your aligned file or turn off 'Hide silence'.")
+    st.error("No video_ids found.")
     st.stop()
 
 vid = st.selectbox("Choose a video_id", video_ids, index=0)
@@ -304,7 +276,6 @@ if df.empty:
 
 facet_map, facet_generic = detect_facet_columns(df)
 
-# Time bounds (reach true last word)
 t_min = float(np.nanmin(pd.to_numeric(df["word_start"], errors="coerce")))
 t_max_words = float(np.nanmax(pd.to_numeric(df["word_end"],   errors="coerce")))
 t_max_slider = float(np.nextafter(t_max_words, np.inf))
@@ -319,28 +290,11 @@ with left:
         st.session_state.cur_t = cur_default
 
     st.session_state.cur_t = st.slider(
-        "Time (s)",
-        min_value=t_min,
-        max_value=t_max_slider,
+        "Time (s)", min_value=t_min, max_value=t_max_slider,
         value=min(st.session_state.cur_t, t_max_words),
-        step=0.001,
-        format="%.3f",
-        key="time_slider",
+        step=0.001, format="%.3f", key="time_slider",
     )
     cur_t = float(st.session_state.cur_t)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("⏮ Start"):
-            st.session_state.cur_t = t_min; st.rerun()
-    with c2:
-        if st.button("⏭ Last word"):
-            st.session_state.cur_t = t_max_words; st.rerun()
-    with c3:
-        if st.button("↦ Next word"):
-            mids = df["word_mid"].values
-            later = mids[mids > cur_t + 1e-6]
-            if len(later): st.session_state.cur_t = float(later.min()); st.rerun()
 
     idx = nearest_idx(cur_t, df["word_mid"].values)
     row = df.iloc[idx]
@@ -351,71 +305,43 @@ with left:
         j = nearest_idx(cur_t, subs["mid"].values)
         st.markdown("**Subtitle (now)**")
         st.write(subs.iloc[j]["text"])
-    else:
-        st.caption("No subtitle segments (no words after filtering).")
 
     # Emotion text
     emo_text, emo_score, emo_cols = pick_emotion_text(row, facet_map, facet_generic)
-    color_map = {"Happy":"green","Angry":"red","Sad":"royalblue","Surprised":"orange",
-                 "Afraid":"purple","Disgusted":"olive","Contempt":"gray","Neutral":"gray"}
-    st.markdown(
-        f"<div style='font-size:26px; font-weight:700; color:{color_map.get(emo_text,'black')};'>"
-        f"Emotion (now): {emo_text}</div>",
-        unsafe_allow_html=True
-    )
-    st.metric("Emotion score", f"{emo_score:.2f}")
+    st.metric("Emotion (now)", f"{emo_text} ({emo_score:.2f})")
 
-    # Video (local or YouTube)
+    # Video handling
     st.markdown("**Video**")
-    local_path = find_local_video(video_dir, vid) if video_dir else None
-    if local_path:
-        st.video(local_path)
-    elif use_youtube:
-        st.video(f"https://www.youtube.com/watch?v={vid}")
-        st.caption("Using YouTube embed (set a local folder for offline playback).")
+    v_local, a_local = get_local_paths(vid)
+    if not v_local or not a_local:
+        st.info(f"Local media not found for {vid}, attempting download...")
+        ok = download_youtube_video(vid)
+        v_local, a_local = get_local_paths(vid) if ok else (None, None)
+
+    if v_local and v_local.exists():
+        st.video(str(v_local))
     else:
-        st.info("No video found. Provide a local folder or enable YouTube embed in the sidebar.")
+        st.error("No playable video found (may be expired).")
 
     st.download_button(
         "Download this video's rows (CSV)",
         data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{vid}_aligned.csv",
-        mime="text/csv"
+        file_name=f"{vid}_aligned.csv", mime="text/csv"
     )
 
 with right:
     st.subheader("Audio waveform")
-    t_wav, y_wav, wav_err = load_waveform_for_vid(vid, audio_dir, video_dir, target_sr=16000)
+    t_wav, y_wav, wav_err = load_waveform_for_vid(vid, target_sr=16000)
     if t_wav is None or y_wav is None:
-        if wav_err == "librosa_not_installed":
-            st.warning("Waveform requires `librosa` and `soundfile`. Install them to enable this panel.")
-        elif wav_err == "no_audio_source":
-            st.info("No audio file found and no local video to decode. "
-                    "Place <video_id>.wav in an Audio folder or a <video_id>.mp4 in a Video folder.")
-        else:
-            st.warning(f"Could not decode audio: {wav_err}")
+        st.info(f"Waveform unavailable: {wav_err}")
     else:
         tt, yy = downsample_for_plot(t_wav, y_wav, max_points=4000)
         wav_fig = go.Figure()
         wav_fig.add_trace(go.Scatter(x=tt, y=yy, mode="lines", name="waveform"))
         ws, we = float(row["word_start"]), float(row["word_end"])
         wav_fig.add_vline(x=cur_t, line_width=2, line_dash="dash")
-        ymin = float(np.nanmin(yy)) if len(yy) else -1.0
-        ymax = float(np.nanmax(yy)) if len(yy) else 1.0
-        pad = 0.05 * (ymax - ymin + 1e-6)
-        wav_fig.add_shape(type="rect", x0=ws, x1=we, y0=ymin - pad, y1=ymax + pad,
+        wav_fig.add_shape(type="rect", x0=ws, x1=we, y0=min(yy), y1=max(yy),
                           line=dict(width=0), fillcolor="rgba(200,200,200,0.3)")
-
-        # If MAE has been computed, overlay peak marks
-        mae_res = st.session_state.get("mae_res")
-        if mae_res and mae_res.get("ok") and "peak_times" in mae_res:
-            wav_fig.add_trace(go.Scatter(
-                x=mae_res["peak_times"], y=[0.0]*len(mae_res["peak_times"]),
-                mode="markers", name="audio peaks", marker=dict(size=6, symbol="x")
-            ))
-
-        wav_fig.update_layout(height=220, margin=dict(l=10,r=10,t=10,b=10),
-                              xaxis_title="time (s)", yaxis_title="amplitude", hovermode="x")
         st.plotly_chart(wav_fig, use_container_width=True)
 
     st.subheader("Timeline & Features")
@@ -427,99 +353,14 @@ with right:
     sel_vis = st.multiselect("OpenFace (visual) features to plot", vis_cols_v, default=default_vis)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df["word_mid"], y=[0]*len(df), mode="markers",
-        marker=dict(size=6), name="words",
-        hovertext=df["word"], hoverinfo="text+x"
-    ))
-    for c in sel_cov:
+    fig.add_trace(go.Scatter(x=df["word_mid"], y=[0]*len(df), mode="markers",
+                             marker=dict(size=6), name="words",
+                             hovertext=df["word"], hoverinfo="text+x"))
+    for c in sel_cov+sel_vis:
         vals = pd.to_numeric(df[c], errors="coerce").values
         if not np.all(np.isnan(vals)):
             mu, sd = np.nanmean(vals), np.nanstd(vals)
             v = (vals - mu) / (sd + 1e-8) if sd > 0 else vals
-            fig.add_trace(go.Scatter(x=df["word_mid"], y=v, mode="lines",
-                                     name=c, hovertemplate=f"{c}: %{{y:.2f}} @ %{{x:.2f}}s<extra></extra>"))
-    for c in sel_vis:
-        vals = pd.to_numeric(df[c], errors="coerce").values
-        if not np.all(np.isnan(vals)):
-            mu, sd = np.nanmean(vals), np.nanstd(vals)
-            v = (vals - mu) / (sd + 1e-8) if sd > 0 else vals
-            fig.add_trace(go.Scatter(x=df["word_mid"], y=v, mode="lines",
-                                     name=c, hovertemplate=f"{c}: %{{y:.2f}} @ %{{x:.2f}}s<extra></extra>"))
-    fig.add_vline(x=cur_t, line_width=2, line_dash="dash",
-                  annotation_text=f"{cur_t:.2f}s", annotation_position="top right")
-    fig.update_layout(height=520, margin=dict(l=10,r=10,t=30,b=10),
-                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                      xaxis_title="time (s)", yaxis_title="(z-score, per feature)", hovermode="x")
+            fig.add_trace(go.Scatter(x=df["word_mid"], y=v, mode="lines", name=c))
+    fig.add_vline(x=cur_t, line_width=2, line_dash="dash")
     st.plotly_chart(fig, use_container_width=True)
-
-# ------------------- FACET panel -------------------
-st.subheader("Facial Expressions (FACET)")
-facet_map_all, facet_generic_all = detect_facet_columns(df)
-if facet_map_all:
-    emo_names = [e for e in BASIC_EMOS if e in facet_map_all]
-    cols = [facet_map_all[k] for k in emo_names]
-    try:
-        i_cur = nearest_idx(float(st.session_state.cur_t), df["word_mid"].values)
-        cur_vals = df.iloc[i_cur:i_cur+1][cols].astype(float).iloc[0].to_dict()
-    except Exception:
-        cur_vals = {k:0.0 for k in cols}
-    bar = go.Figure([go.Bar(x=[e.title() for e in emo_names],
-                            y=[cur_vals.get(facet_map_all[e], 0.0) for e in emo_names])])
-    bar.update_layout(height=250, margin=dict(l=10,r=10,t=30,b=10),
-                      yaxis_title="Score / prob.", xaxis_title="Emotion")
-    st.plotly_chart(bar, use_container_width=True)
-
-    topk = st.slider("Show top-k emotions over time", 3, min(6, len(cols)), 5)
-    means = df[cols].astype(float).mean().sort_values(ascending=False)
-    top_cols = list(means.index[:topk])
-    emo_fig = go.Figure()
-    for c in top_cols:
-        emo_fig.add_trace(go.Scatter(x=df["word_mid"], y=df[c].astype(float), mode="lines",
-                                     name=c.replace("facet_","").title()))
-    emo_fig.add_vline(x=float(st.session_state.cur_t), line_width=2, line_dash="dash")
-    emo_fig.update_layout(height=300, margin=dict(l=10,r=10,t=30,b=10),
-                          xaxis_title="time (s)", yaxis_title="score", hovermode="x")
-    st.plotly_chart(emo_fig, use_container_width=True)
-elif any(c.lower().startswith("facet_") for c in df.columns):
-    st.caption("Generic FACET columns detected. Named emotion columns will give nicer labels.")
-else:
-    st.info("No FACET columns found. Re-run alignment with the FACET .csd to produce 'facet_*' columns.")
-
-# ------------------- Transcript window -------------------
-st.subheader("Transcript window")
-window = st.slider("Rows around cursor", 3, 30, 10)
-cur_idx = nearest_idx(float(st.session_state.cur_t), df["word_mid"].values)
-lo = max(0, cur_idx - window); hi = min(len(df), cur_idx + window + 1)
-cov_cols_show = get_cols_by_prefix(df, "covarep_f")
-vis_cols_show = get_cols_by_prefix(df, "visual_f")
-cols_to_show = ["video_id","word_start","word_end","word_mid","word"]
-if "label" in df.columns: cols_to_show.append("label")
-cols_to_show += cov_cols_show[:2] + vis_cols_show[:2]
-st.dataframe(df.iloc[lo:hi][cols_to_show], use_container_width=True)
-
-# ------------------- Evaluation (sidebar): MAE -------------------
-st.sidebar.header("Evaluation")
-st.sidebar.caption("Sync accuracy = MAE between word midpoints and nearest audio RMS peaks.")
-if librosa is None:
-    st.sidebar.warning("Install `librosa` + `soundfile` to enable MAE.")
-else:
-    peak_q = st.sidebar.slider("Peak threshold (RMS quantile)", 0.50, 0.95, 0.70, 0.01)
-    win_s  = st.sidebar.slider("Search window (± seconds)", 0.10, 0.80, 0.35, 0.05)
-    if st.sidebar.button("Compute MAE (current video)"):
-        with st.spinner("Computing MAE…"):
-            res = compute_sync_mae(
-                vid, df, audio_dir=audio_dir, video_dir=video_dir,
-                sr=16000, frame_length=1024, hop_length=512,
-                peak_quantile=peak_q, window_s=win_s
-            )
-        st.session_state["mae_res"] = res
-
-    res = st.session_state.get("mae_res")
-    if res and res.get("ok"):
-        st.sidebar.success(f"MAE: {res['mae']:.03f}s")
-        st.sidebar.write(f"Median: {res['median']:.03f}s • P90: {res['p90']:.03f}s")
-        st.sidebar.caption(f"Words: {res['n_words']} • Peaks: {res['n_peaks']} • Window ±{res['window_s']:.2f}s • q={res['peak_quantile']:.2f}")
-    elif res and not res.get("ok"):
-        st.sidebar.warning(f"MAE unavailable: {res.get('reason','unknown')}")
-
